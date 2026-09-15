@@ -13,21 +13,38 @@ replication-, or PUT-durable, not buffered. Measurements per backend:
   `DurableBuffer.append_batch/4` with N payloads per call.
 - **Mixed append + stream** — writers appending while readers repeatedly
   re-stream whole partitions; both sides measured simultaneously.
+- **Stream only** (local) — readers re-streaming with no writers at all, so
+  the read path is measured on its own.
+- **Seek** (local) — time to the first entry of a `from:` read at
+  increasing depth, which is where a scan would show up.
 - **Caller latency** — Benchee distributions for a single append under
   increasing `parallel:` load.
+
+> **The append grid below dates from 2026-08-04 and needs a clean
+> re-capture.** The harness matched `:ok` from `append/3`, which started
+> returning `{:ok, offset}` in 0.4.0, so every bench crashed on its first
+> append from that change until 2026-09-04. Nothing compiles or runs
+> `bench/`, so it went unnoticed. The read sections below are from
+> 2026-09-04 on the fixed harness.
+>
+> Single-caller rows are fsync-bound and **vary ±40% run to run** on this
+> machine — repeated medians of the same build ranged 1.4k-3.7k ops/s. Do
+> not read a regression out of one run; alternate builds and take medians.
 
 Reproduce with:
 
 ```sh
 mix run bench/local_bench.exs
 REPLICAS=2 ACK=all mix run bench/replica_bench.exs
+mix run bench/transport_bench.exs
 mix run bench/s3_bench.exs                              # fake S3, 30ms PUT
 S3_BENCH_BUCKET=my-bucket mix run bench/s3_bench.exs    # real S3
 ```
 
 `BENCH_DURATION_MS`, `BENCH_WARMUP_MS`, and `BENCH_TIME` shorten runs;
 `PARTITIONS` overrides partition count. Numbers at the disk-bandwidth
-ceiling vary ±20-30% between runs.
+ceiling vary ±20-30% between runs, and single-caller fsync-bound rows vary
+considerably more.
 
 ## Local (10 partitions)
 
@@ -104,6 +121,45 @@ parallel      average     median     99th %
 16            2.31 ms    2.13 ms    6.73 ms
 128           3.49 ms    3.17 ms   12.16 ms
 ```
+
+## Stream only (1 partition, 4 KB payloads, 20k entries)
+
+Reads with no writers, re-streaming the whole partition end to end. A single
+reader sustains **~1.8-2.2 GB/s**; readers scale to roughly the SSD's read
+ceiling, which is where the per-reader rate stops improving.
+
+```
+readers      entries/s      MB/s  full scans/s
+1               460.0k    1796.9          23.0
+8                1.74M    6796.9          87.0
+64               2.13M    8333.3         106.7
+```
+
+`mixed_grid` measures reads against concurrent appends and cannot separate
+the two; this is the read path alone.
+
+## Seek (1 partition, 256 B payloads, 200k entries)
+
+Time to the **first** entry of a `from:` read, which is where a scan would
+show up. This is what the sparse index is for.
+
+```
+from             us/seek    entries/s      us/seek (index: false)
+0                  367.4         2.7k                       366.1
+50.0k              327.9         3.0k                     14175.5
+100.0k             319.1         3.1k                     20245.7
+180.0k             366.7         2.7k                     50406.3
+198.0k             352.9         2.8k                     44872.1
+```
+
+**Flat with the index, linear without it.** A resume 180k entries into the
+log costs the same as one at the head — 367 us — because the index binary-
+searches to the batch and skips the few entries inside it. Turn the index
+off and the same read scans the log: 50 ms, **137x slower**. That gap is the
+index's whole reason for existing, and nothing measured it until now.
+
+The flat cost is dominated by opening the WAL and the index and reading the
+first chunk, not by the search.
 
 ## Replica (2 replica nodes, ack :all, 10 partitions)
 
@@ -205,3 +261,52 @@ parallel      average     median     99th %
 
 At 64 parallel callers the median is ~2× PUT latency: a caller lands mid-PUT,
 waits for it to finish, then rides the next group commit.
+
+## Replication transport
+
+`mix run bench/transport_bench.exs`
+
+Append throughput and caller latency for each transport, with and without an
+unrelated load on the distribution channel between the same node pair. The
+hog is four processes shipping 4 MiB `:erpc` payloads to the replica node —
+traffic replication has nothing to do with, which is the point. `HOGS`
+(default `0,4`) sets the counts. `BENCH_DURATION_MS`, `BENCH_WARMUP_MS` and
+`PARTITIONS` apply as elsewhere.
+
+Both nodes run on this host, so this measures contention for one socket and
+the scheduler, not a saturated network. Three runs, 64 KiB payloads, 8
+partitions:
+
+| transport | hogs | ops/s | p50 us | p99 us |
+|---|---|---|---|---|
+| distribution | 0 | 26402 / 29750 / 20578 | 388 / 376 / 377 | 1926 / 1939 / 1886 |
+| distribution | 4 | 10360 / 10457 / 10238 | 3356 / 3482 / 2712 | 8743 / 13206 / 10738 |
+| gen_rpc | 0 | 29062 / 32108 / 29387 | 403 / 379 / 414 | 2017 / 1933 / 1917 |
+| gen_rpc | 4 | 26140 / 14324 / 25035 | 511 / 500 / 516 | 2102 / 2123 / 3206 |
+
+**Idle, the two are the same.** Same p50 to within 10%, same p99, and
+overlapping throughput. Nothing here argues for gen_rpc on a quiet pair.
+
+**Under contention, all three columns separate, and the direction is the
+same in every run.**
+
+* **Throughput.** Distribution drops to ~10.3k ops/s, from ~26k idle — a
+  2.5x fall, and the most repeatable number in the table (10360 / 10457 /
+  10238). gen_rpc holds 14k-26k.
+* **p50.** Distribution rises 7-9x, to ~2700-3500 us. gen_rpc rises about
+  1.3x, to ~510 us.
+* **p99.** Distribution rises 4.5-7x, to ~8700-13200 us. gen_rpc stays
+  within 1.1-1.7x of idle.
+
+So a contended pair costs distribution most of its throughput and roughly an
+order of magnitude of median latency. gen_rpc gives up little of either.
+
+**An earlier version of this bench reported no throughput difference.** That
+was a harness bug, not a finding. `hog_loop/2` put its recursive call inside
+a `try` — a function-level `catch` wraps the whole body — so it was not a
+tail call and each hog's stack grew without bound (measured: 71 MB and
+climbing, against 2.7 KB for the fixed loop). The load the hogs applied
+therefore drifted across the measurement window instead of staying constant,
+which buried the effect. The hogs also were not awaited on kill and the
+replica writers were never stopped, so residue accumulated in loop order.
+All three are fixed.

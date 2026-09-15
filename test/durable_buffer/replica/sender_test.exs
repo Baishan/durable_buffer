@@ -36,7 +36,8 @@ defmodule DurableBuffer.Replica.SenderTest do
             primary_tail: 0,
             epoch: 0,
             rpc_timeout: 500,
-            max_bytes: 64 * 1024 * 1024
+            max_bytes: 64 * 1024 * 1024,
+            transport: DurableBuffer.Transport.Distribution
           ],
           opts
         )
@@ -47,7 +48,7 @@ defmodule DurableBuffer.Replica.SenderTest do
 
   defp commit_both(local, sender, binary) do
     offset = Local.offset(local)
-    {:ok, local} = Local.commit(local, binary, byte_size(binary))
+    {:ok, local} = Local.commit(local, binary, byte_size(binary), {offset, 1})
     :ok = Sender.commit(sender, 0, offset, binary)
     local
   end
@@ -101,8 +102,23 @@ defmodule DurableBuffer.Replica.SenderTest do
   test "resyncs a fresh replica from the primary WAL on attach", %{tmp_dir: tmp_dir} do
     {primary_dir, _replica_dir} = dirs(tmp_dir)
     local = open_primary(primary_dir)
-    {:ok, local} = Local.commit(local, entry("old-one"), byte_size(entry("old-one")))
-    {:ok, local} = Local.commit(local, entry("old-two"), byte_size(entry("old-two")))
+
+    {:ok, local} =
+      Local.commit(
+        local,
+        entry("old-one"),
+        byte_size(entry("old-one")),
+        {Local.offsets(local).next, 1}
+      )
+
+    {:ok, local} =
+      Local.commit(
+        local,
+        entry("old-two"),
+        byte_size(entry("old-two")),
+        {Local.offsets(local).next, 1}
+      )
+
     tail = Local.offset(local)
 
     _sender = start_sender(tmp_dir, primary_tail: tail)
@@ -156,16 +172,86 @@ defmodule DurableBuffer.Replica.SenderTest do
     local = commit_both(local, sender, entry("pre-truncate"))
     await_watermark({0, Local.offset(local)})
 
-    {:ok, local} = Local.truncate(local)
+    {:ok, local} = Local.truncate(local, 0)
     :ok = Sender.reset(sender, 1)
-    :ok = DurableBuffer.Replica.truncate(replica_dir, 0, 1)
+    :ok = DurableBuffer.Replica.truncate(replica_dir, 0, 1, 0)
 
     fresh = entry("fresh")
-    {:ok, local} = Local.commit(local, fresh, byte_size(fresh))
+    {:ok, local} = Local.commit(local, fresh, byte_size(fresh), {Local.offsets(local).next, 1})
     :ok = Sender.commit(sender, 1, 0, fresh)
 
     await_watermark({1, byte_size(fresh)})
     assert replica_entries(tmp_dir) == ["fresh"]
+    Local.close(local)
+  end
+
+  test "drops an ack that belongs to an earlier attach", %{tmp_dir: tmp_dir} do
+    {primary_dir, _replica_dir} = dirs(tmp_dir)
+    local = open_primary(primary_dir)
+    sender = start_sender(tmp_dir, [])
+
+    commit_both(local, sender, entry("replicated"))
+    assert_receive {:backend, {:watermark, _node, {0, _offset}}}, 1000
+
+    send(sender, {:replica_ack, make_ref(), {0, 999_999}})
+
+    refute_receive {:backend, {:watermark, _node, {0, 999_999}}}, 200
+
+    Sender.stop(sender)
+    Local.close(local)
+  end
+
+  test "adopts the replica tail on attach instead of truncating it", %{tmp_dir: tmp_dir} do
+    {primary_dir, replica_dir} = dirs(tmp_dir)
+    local = open_primary(primary_dir)
+    sender = start_sender(tmp_dir, [])
+
+    kept = entry("on-both")
+    ahead = entry("already-durable-on-the-replica")
+
+    local = commit_both(local, sender, kept)
+    await_watermark({0, byte_size(kept)})
+    flush_watermarks()
+
+    {:ok, _watermark} = DurableBuffer.Replica.commit(replica_dir, 0, 0, byte_size(kept), ahead)
+    assert replica_entries(tmp_dir) == ["on-both", "already-durable-on-the-replica"]
+
+    GenServer.stop(DurableBuffer.Replica.writer_pid(replica_dir, 0, true))
+    :ok = Sender.commit(sender, 0, byte_size(kept), ahead)
+
+    assert_receive {:backend, {:watermark, _node, watermark}}, 5000
+    assert watermark == {0, byte_size(kept) + byte_size(ahead)}
+    assert replica_entries(tmp_dir) == ["on-both", "already-durable-on-the-replica"]
+
+    Sender.stop(sender)
+    Local.close(local)
+  end
+
+  defp flush_watermarks do
+    receive do
+      {:backend, {:watermark, _node, _watermark}} -> flush_watermarks()
+    after
+      50 -> :ok
+    end
+  end
+
+  test "reset re-attaches at once and truncates a replica on the old epoch",
+       %{tmp_dir: tmp_dir} do
+    {primary_dir, _replica_dir} = dirs(tmp_dir)
+    local = open_primary(primary_dir)
+    sender = start_sender(tmp_dir, [])
+
+    binary = entry("pre-truncate")
+    local = commit_both(local, sender, binary)
+    await_watermark({0, byte_size(binary)})
+    assert replica_entries(tmp_dir) == ["pre-truncate"]
+
+    :ok = Sender.reset(sender, 1)
+
+    assert_receive {:backend, {:adopted, _node, 1}}, 2000
+    assert replica_entries(tmp_dir) == []
+
+    Sender.stop(sender)
     Local.close(local)
   end
 end

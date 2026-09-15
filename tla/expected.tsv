@@ -1,0 +1,15 @@
+Replication	VIOLATED
+Replication_adopt	PASS
+Replication_ahead	VIOLATED
+Replication_core	PASS
+Replication_dirtyread	VIOLATED
+Replication_gatedread	PASS
+Replication_heal	PASS
+Replication_loss	PASS
+Replication_nocrash	PASS
+Replication_noepoch	VIOLATED
+Replication_notailcheck	VIOLATED
+Replication_quorum	PASS
+Replication_staletruncate	VIOLATED
+Replication_trim	PASS
+Replication_trimskew	VIOLATED

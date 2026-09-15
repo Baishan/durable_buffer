@@ -19,12 +19,12 @@ defmodule DurableBuffer.ManualAsyncBackend do
   end
 
   @impl DurableBuffer.Backend
-  def commit(_state, _batch, _byte_size) do
+  def commit(_state, _batch, _byte_size, _span) do
     raise "ManualAsyncBackend only supports the async commit contract"
   end
 
   @impl DurableBuffer.Backend
-  def commit_async(state, _batch, _byte_size, tag) do
+  def commit_async(state, _batch, _byte_size, _span, tag) do
     send(state.owner, {:submitted, tag, self()})
     {:pending, state}
   end
@@ -38,7 +38,7 @@ defmodule DurableBuffer.ManualAsyncBackend do
   def stream(_config, _partition_index), do: []
 
   @impl DurableBuffer.Backend
-  def truncate(state), do: {:ok, state}
+  def truncate(state, _next), do: {:ok, state}
 
   @impl DurableBuffer.Backend
   def close(_state), do: :ok

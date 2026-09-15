@@ -4,7 +4,7 @@ defmodule DurableBuffer.MixProject do
   def project do
     [
       app: :durable_buffer,
-      version: "0.3.0",
+      version: "0.5.0",
       elixir: "~> 1.16",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -27,6 +27,7 @@ defmodule DurableBuffer.MixProject do
       {:req, "~> 0.5", optional: true},
       {:req_s3, "~> 0.2", optional: true},
       {:benchee, "~> 1.3", only: :dev},
+      {:gen_rpc, git: "https://github.com/emqx/gen_rpc.git", tag: "3.6.1", only: [:dev, :test]},
       {:plug, "~> 1.16", only: [:dev, :test]}
     ]
   end

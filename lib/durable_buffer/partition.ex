@@ -16,6 +16,12 @@ defmodule DurableBuffer.Partition do
   moderate load). `max_batch_bytes` / `max_batch_entries` force an immediate
   handoff under heavy load.
 
+  A partition that carries a retention policy also runs it on a timer,
+  submitting the trim through the committer so it queues behind pending
+  commits instead of pre-empting them. The first tick lands on a random
+  offset within `retention_interval_ms`, so partitions do not all trim at
+  the same instant.
+
   With the default `flush_delay_ms: 0` the dwell is adaptive: the committer
   reports how long commits are taking to complete via `{:dwell_hint, ms}`
   messages, and a batch that starts while the partition is idle waits that
@@ -28,6 +34,7 @@ defmodule DurableBuffer.Partition do
 
   use GenServer
 
+  alias DurableBuffer.Backend
   alias DurableBuffer.Partition.Committer
   alias DurableBuffer.WAL
 
@@ -38,7 +45,8 @@ defmodule DurableBuffer.Partition do
   @doc """
   Appends a payload and blocks until it is durable.
   """
-  @spec append(GenServer.server(), iodata(), timeout()) :: :ok | {:error, term()}
+  @spec append(GenServer.server(), iodata(), timeout()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
   def append(server, payload, timeout \\ :infinity) do
     GenServer.call(server, {:append, payload}, timeout)
   end
@@ -51,10 +59,11 @@ defmodule DurableBuffer.Partition do
   group commit together, so the per-call messaging cost is paid once for the
   entire list — the main lever for small-payload throughput.
   """
-  @spec append_batch(GenServer.server(), [iodata()], timeout()) :: :ok | {:error, term()}
+  @spec append_batch(GenServer.server(), [iodata()], timeout()) ::
+          {:ok, Range.t() | []} | {:error, term()}
   def append_batch(server, payloads, timeout \\ :infinity)
 
-  def append_batch(_server, [], _timeout), do: :ok
+  def append_batch(_server, [], _timeout), do: {:ok, []}
 
   def append_batch(server, payloads, timeout) do
     GenServer.call(server, {:append_batch, payloads}, timeout)
@@ -88,6 +97,32 @@ defmodule DurableBuffer.Partition do
     GenServer.call(server, :truncate, timeout)
   end
 
+  @doc """
+  Drops every entry below `upto`, or applies the buffer's retention policy
+  when `upto` is `:policy`.
+  """
+  @spec trim(GenServer.server(), non_neg_integer() | :policy, timeout()) ::
+          :ok | {:error, term()}
+  def trim(server, upto, timeout \\ :infinity) do
+    GenServer.call(server, {:trim, upto}, timeout)
+  end
+
+  @doc """
+  Reports what retention has to work with for this partition.
+  """
+  @spec retention_status(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
+  def retention_status(server, timeout \\ :infinity) do
+    GenServer.call(server, :retention_status, timeout)
+  end
+
+  @doc """
+  Reports the backend's per-replica replication state.
+  """
+  @spec replica_status(GenServer.server(), timeout()) :: {:ok, map()} | {:error, term()}
+  def replica_status(server, timeout \\ :infinity) do
+    GenServer.call(server, :replica_status, timeout)
+  end
+
   @impl GenServer
   def init(opts) do
     {backend, config} = Keyword.fetch!(opts, :backend)
@@ -98,12 +133,16 @@ defmodule DurableBuffer.Partition do
         backend,
         config,
         partition_index,
-        Keyword.take(opts, [:max_inflight_commits])
+        Keyword.take(opts, [:max_inflight_commits, :durable_offsets, :retention])
       )
+
+    retention_interval_ms = retention_interval(backend, opts)
+    schedule_retention(retention_interval_ms, true)
 
     {:ok,
      %{
        committer: committer,
+       retention_interval_ms: retention_interval_ms,
        pending: [],
        pending_bytes: 0,
        pending_count: 0,
@@ -119,11 +158,11 @@ defmodule DurableBuffer.Partition do
 
   @impl GenServer
   def handle_call({:append, payload}, from, state) do
-    {:noreply, enqueue(state, from, encode_one(payload))}
+    {:noreply, enqueue(state, from, encode_one(payload), :offset)}
   end
 
   def handle_call({:append_batch, payloads}, from, state) do
-    {:noreply, enqueue(state, from, encode_many(payloads))}
+    {:noreply, enqueue(state, from, encode_many(payloads), :range)}
   end
 
   def handle_call(:sync, from, %{pending: []} = state) do
@@ -139,6 +178,22 @@ defmodule DurableBuffer.Partition do
     {:noreply, state}
   end
 
+  def handle_call({:trim, upto}, from, state) do
+    state = if state.pending == [], do: state, else: handoff(state)
+    Committer.request_trim(state.committer, from, upto)
+    {:noreply, state}
+  end
+
+  def handle_call(:replica_status, from, state) do
+    Committer.request_replica_status(state.committer, from)
+    {:noreply, state}
+  end
+
+  def handle_call(:retention_status, from, state) do
+    Committer.request_retention_status(state.committer, from)
+    {:noreply, state}
+  end
+
   def handle_call(:truncate, from, state) do
     state = if state.pending == [], do: state, else: handoff(state)
     Committer.request_truncate(state.committer, from)
@@ -147,7 +202,7 @@ defmodule DurableBuffer.Partition do
 
   @impl GenServer
   def handle_cast({:append, payload}, state) do
-    {:noreply, enqueue(state, nil, encode_one(payload))}
+    {:noreply, enqueue(state, nil, encode_one(payload), :offset)}
   end
 
   @impl GenServer
@@ -175,8 +230,39 @@ defmodule DurableBuffer.Partition do
     {:noreply, %{state | hinted_dwell_ms: dwell_ms}}
   end
 
+  def handle_info(:retention, state) do
+    state = if state.pending == [], do: state, else: handoff(state)
+    Committer.request_trim(state.committer, nil, :policy)
+    schedule_retention(state.retention_interval_ms, false)
+    {:noreply, state}
+  end
+
   def handle_info(_message, state) do
     {:noreply, state}
+  end
+
+  defp retention_interval(backend, opts) do
+    policy = Keyword.get(opts, :retention, %{ms: nil, bytes: nil})
+    interval = Keyword.get(opts, :retention_interval_ms, 60_000)
+
+    if (policy.ms != nil or policy.bytes != nil) and Backend.applies_retention?(backend) and
+         function_exported?(backend, :trim, 2) do
+      interval
+    else
+      :infinity
+    end
+  end
+
+  defp schedule_retention(:infinity, _first?), do: :ok
+
+  defp schedule_retention(interval, true) do
+    _timer = Process.send_after(self(), :retention, :rand.uniform(interval))
+    :ok
+  end
+
+  defp schedule_retention(interval, false) do
+    _timer = Process.send_after(self(), :retention, interval)
+    :ok
   end
 
   defp encode_one(payload) do
@@ -194,10 +280,10 @@ defmodule DurableBuffer.Partition do
     {Enum.reverse(entries), count, bytes}
   end
 
-  defp enqueue(state, from, {entries, count, bytes}) do
+  defp enqueue(state, from, {entries, count, bytes}, shape) do
     state = %{
       state
-      | pending: [{:entries, from, entries} | state.pending],
+      | pending: [{:entries, from, entries, count, shape} | state.pending],
         pending_bytes: state.pending_bytes + bytes,
         pending_count: state.pending_count + count
     }

@@ -5,18 +5,40 @@ defmodule DurableBuffer.Replica.Sender do
   Owns a long-lived, ordered channel to the remote
   `DurableBuffer.Replica.Writer` and pipelines batches over it without
   waiting for acks, so a slow or dead replica never blocks the commit path —
-  it only stalls its own channel (sends block this process when the
-  distribution buffer to the replica is full, which is the intended
-  backpressure). Acks come back as durability watermarks and are forwarded
-  to the owner as `{:backend, {:watermark, node, watermark}}` messages.
+  it only stalls its own channel. Acks come back as durability watermarks
+  and are forwarded to the owner as `{:backend, {:watermark, node,
+  watermark}}` messages.
+
+  Batches go out over the `DurableBuffer.Transport` the backend configured,
+  resolved to a channel once per attach. `Transport.Distribution` sends to
+  the remote writer pid, and those sends block this process when the
+  distribution buffer to the replica is full — the intended backpressure.
+  Everything else here stays on distribution whatever the transport is: the
+  `:erpc` attach and truncate, the acks, and the `Process.monitor/1` that
+  forces a re-attach when the writer dies.
+
+  A transport that cannot open a channel or cannot send is not fatal. Both
+  are caught, logged, and healed by re-attaching, like every other failure
+  here. That matters more than it looks: this process is linked to the
+  committer, which stops the whole partition on a non-normal exit, so a
+  crash here would turn one dead replica into an outage.
+
+  `attach_ref` is the attached/not-attached sentinel throughout, because
+  this process mints it. The channel is not — it is an opaque transport
+  value, and a transport is free to make `nil` a legitimate one.
 
   On every (re)connect the sender attaches with the remote writer's tail
-  `{epoch, offset}` and reconciles: a replica already at the expected
-  position resumes live traffic; a replica that is behind gets the missing
-  suffix streamed straight from the primary's WAL file in chunks before
-  live traffic resumes; a replica on an older epoch (it missed a truncate)
-  or ahead of the primary (it holds bytes the primary lost) is truncated
-  and re-replicated from offset zero. Catch-up therefore needs no separate
+  `{epoch, offset}` and reconciles against the primary's own WAL, not
+  against its unacked queue: a replica holding a prefix of the primary WAL
+  resumes live traffic, and anything it already has is dropped from the
+  queue and counted as the watermark it is; a replica that is behind gets
+  the missing suffix streamed straight from the primary's WAL file in chunks
+  first; a replica on an older epoch (it missed a truncate) is truncated and
+  re-replicated from offset zero. A replica *ahead of the primary* is
+  truncated too, but that is a last resort and it is logged:
+  `DurableBuffer.Backend.Replica.open/2` heals the primary from such a
+  replica before the partition serves, so a sender only sees one when the
+  replica was unreachable at open. Catch-up therefore needs no separate
   bookkeeping: the WAL is the queue, and every failure — writer death,
   rejected batch, unacked-queue overflow, ack stall — heals by
   re-attaching.
@@ -24,11 +46,19 @@ defmodule DurableBuffer.Replica.Sender do
   Unacked batches are kept in a bounded in-memory queue (`:max_sender_bytes`)
   so the common reconnect case avoids re-reading the WAL; the writer
   re-acknowledges duplicates idempotently, so re-sends are safe.
+
+  Every attach mints a reference that stamps the batches it sends, and the
+  writer echoes it on each ack. Acks carrying any other reference are
+  dropped. Without that, an ack still in flight when the sender re-attaches
+  and truncates the replica would be applied afterwards, and the primary
+  would count a replica as durable through an offset it no longer holds.
   """
 
   use GenServer
 
   require Logger
+
+  alias DurableBuffer.Meta
 
   @connect_retry_ms 1000
   @resync_chunk_bytes 1024 * 1024
@@ -47,8 +77,15 @@ defmodule DurableBuffer.Replica.Sender do
   end
 
   @doc """
-  Clears the queue and adopts `epoch` with an empty primary WAL. Called
-  after a truncate, once the pipeline is drained.
+  Clears the queue, adopts `epoch` with an empty primary WAL, and re-attaches
+  at once. Called after a truncate, once the pipeline is drained.
+
+  The re-attach is what makes a truncate converge. `Backend.Replica.truncate/1`
+  sends each replica an `:erpc` truncate that may fail, and a replica that
+  misses it keeps the old epoch and its pre-truncate data. Re-attaching makes
+  the sender compare epochs immediately, truncate the replica itself, and
+  keep retrying on its reconnect timer until the replica confirms — rather
+  than waiting for the next commit to be rejected.
   """
   @spec reset(GenServer.server(), non_neg_integer()) :: :ok
   def reset(sender, epoch) do
@@ -72,15 +109,21 @@ defmodule DurableBuffer.Replica.Sender do
        partition_index: Keyword.fetch!(opts, :partition_index),
        primary_dir: Keyword.fetch!(opts, :primary_dir),
        primary_tail: Keyword.fetch!(opts, :primary_tail),
+       primary_base: 0,
        epoch: Keyword.fetch!(opts, :epoch),
        rpc_timeout: Keyword.fetch!(opts, :rpc_timeout),
        max_bytes: Keyword.fetch!(opts, :max_bytes),
        fsync: Keyword.get(opts, :fsync, false),
+       transport: Keyword.fetch!(opts, :transport),
        writer: nil,
+       channel: nil,
        monitor: nil,
+       attach_ref: nil,
        mode: :live,
        resync_fd: nil,
        resync_cursor: nil,
+       resync_base: nil,
+       resync_stall_check: nil,
        queue: :queue.new(),
        queued_bytes: 0,
        watermark: {0, 0},
@@ -119,26 +162,49 @@ defmodule DurableBuffer.Replica.Sender do
 
   @impl GenServer
   def handle_call({:reset, epoch}, _from, state) do
-    state = close_resync(state)
+    state = %{
+      state
+      | epoch: epoch,
+        primary_tail: 0,
+        primary_base: 0,
+        queue: :queue.new(),
+        queued_bytes: 0,
+        watermark: {0, 0}
+    }
 
-    {:reply, :ok,
-     %{
-       state
-       | epoch: epoch,
-         primary_tail: 0,
-         queue: :queue.new(),
-         queued_bytes: 0,
-         mode: :live
-     }}
+    {:reply, :ok, reattach(state, 0)}
   end
 
   @impl GenServer
-  def handle_info(:connect, %{writer: nil} = state) do
+  def handle_info(:connect, %{attach_ref: nil} = state) do
     case attach(state) do
       {:ok, writer, remote_tail} ->
         monitor = Process.monitor(writer)
-        state = %{state | writer: writer, monitor: monitor}
-        {:noreply, reconcile(state, remote_tail)}
+
+        case open_channel(state, writer) do
+          {:ok, channel} ->
+            state = %{
+              state
+              | writer: writer,
+                channel: channel,
+                monitor: monitor,
+                attach_ref: make_ref(),
+                primary_base: primary_base(state)
+            }
+
+            {:noreply, reconcile(state, remote_tail)}
+
+          {:error, reason} ->
+            Logger.warning(
+              "DurableBuffer replica sender to #{inspect(state.node)} " <>
+                "(#{state.dir} p#{state.partition_index}) could not open a " <>
+                "#{inspect(state.transport)} channel: #{inspect(reason)}; retrying"
+            )
+
+            Process.demonitor(monitor, [:flush])
+            Process.send_after(self(), :connect, @connect_retry_ms)
+            {:noreply, state}
+        end
 
       :error ->
         Process.send_after(self(), :connect, @connect_retry_ms)
@@ -150,7 +216,7 @@ defmodule DurableBuffer.Replica.Sender do
     {:noreply, state}
   end
 
-  def handle_info(:resync_step, %{mode: :resync, writer: writer} = state) when writer != nil do
+  def handle_info(:resync_step, %{mode: :resync, attach_ref: ref} = state) when ref != nil do
     target = next_needed(state)
     cursor = state.resync_cursor
 
@@ -160,12 +226,24 @@ defmodule DurableBuffer.Replica.Sender do
         state = resend_queue(%{state | mode: :live})
         {:noreply, ensure_progress_check(state)}
 
+      resync_inflight(state) >= state.max_bytes ->
+        {:noreply, ensure_resync_stall_check(state)}
+
       true ->
-        case :file.pread(state.resync_fd, cursor, min(@resync_chunk_bytes, target - cursor)) do
+        case :file.pread(
+               state.resync_fd,
+               cursor - state.primary_base,
+               min(@resync_chunk_bytes, target - cursor)
+             ) do
           {:ok, data} when byte_size(data) > 0 ->
-            send(state.writer, {:replicate, state.epoch, cursor, data, self()})
-            send(self(), :resync_step)
-            {:noreply, %{state | resync_cursor: cursor + byte_size(data)}}
+            case send_batch(state, state.epoch, cursor, data) do
+              :ok ->
+                send(self(), :resync_step)
+                {:noreply, %{state | resync_cursor: cursor + byte_size(data)}}
+
+              {:error, reason} ->
+                {:noreply, note_send_failure(state, reason)}
+            end
 
           _eof_or_error ->
             {:noreply, force_reattach(state)}
@@ -177,7 +255,7 @@ defmodule DurableBuffer.Replica.Sender do
     {:noreply, state}
   end
 
-  def handle_info({:replica_ack, watermark}, state) do
+  def handle_info({:replica_ack, ref, watermark}, %{attach_ref: ref} = state) do
     send(state.owner, {:backend, {:watermark, state.node, watermark}})
     {queue, queued_bytes} = drop_acked(state.queue, state.queued_bytes, watermark)
 
@@ -188,10 +266,34 @@ defmodule DurableBuffer.Replica.Sender do
         queued_bytes: queued_bytes
     }
 
+    if state.mode == :resync and resync_inflight(state) < state.max_bytes do
+      send(self(), :resync_step)
+    end
+
     {:noreply, state}
   end
 
-  def handle_info({:replica_nack, {:sequence_mismatch, %{got: {epoch, _offset}}} = reason}, state)
+  def handle_info({:check_resync, cursor, watermark}, state) do
+    state = %{state | resync_stall_check: nil}
+
+    if state.mode == :resync and state.resync_cursor == cursor and
+         state.watermark == watermark do
+      Logger.warning(
+        "DurableBuffer replica sender to #{inspect(state.node)} " <>
+          "(#{state.dir} p#{state.partition_index}) stalled resyncing at offset " <>
+          "#{cursor} with a full window; reattaching"
+      )
+
+      {:noreply, force_reattach(state)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {:replica_nack, ref, {:sequence_mismatch, %{got: {epoch, _offset}}} = reason},
+        %{attach_ref: ref} = state
+      )
       when epoch >= state.epoch do
     Logger.warning(
       "DurableBuffer replica sender to #{inspect(state.node)} " <>
@@ -201,11 +303,14 @@ defmodule DurableBuffer.Replica.Sender do
     {:noreply, force_reattach(state)}
   end
 
-  def handle_info({:replica_nack, {:sequence_mismatch, _details}}, state) do
+  def handle_info(
+        {:replica_nack, ref, {:sequence_mismatch, _details}},
+        %{attach_ref: ref} = state
+      ) do
     {:noreply, state}
   end
 
-  def handle_info({:replica_nack, reason}, state) do
+  def handle_info({:replica_nack, ref, reason}, %{attach_ref: ref} = state) do
     Logger.warning(
       "DurableBuffer replica sender to #{inspect(state.node)} " <>
         "(#{state.dir} p#{state.partition_index}) commit failed: #{inspect(reason)}; retrying"
@@ -222,7 +327,7 @@ defmodule DurableBuffer.Replica.Sender do
     state = %{state | progress_check: nil}
 
     if not :queue.is_empty(state.queue) and state.watermark == watermark_at_send and
-         state.mode == :live and state.writer != nil do
+         state.mode == :live and state.attach_ref != nil do
       {:noreply, force_reattach(state)}
     else
       {:noreply, ensure_progress_check(state)}
@@ -249,22 +354,66 @@ defmodule DurableBuffer.Replica.Sender do
   end
 
   defp reconcile(state, {remote_epoch, remote_offset} = remote_tail) do
-    expected = {state.epoch, next_needed(state)}
-
     cond do
-      remote_tail == expected ->
-        state = resend_queue(%{state | mode: :live})
-        ensure_progress_check(state)
+      remote_epoch != state.epoch ->
+        wipe_and_resync(state)
 
-      remote_epoch == state.epoch and remote_offset < next_needed(state) ->
-        start_resync(state, remote_offset)
+      remote_offset > state.primary_tail ->
+        Logger.warning(
+          "DurableBuffer replica sender to #{inspect(state.node)} " <>
+            "(#{state.dir} p#{state.partition_index}) found the replica " <>
+            "#{remote_offset - state.primary_tail} bytes ahead of the primary and " <>
+            "is discarding them. The primary heals at open, so reaching this means " <>
+            "the replica was unreachable then."
+        )
+
+        wipe_and_resync(state)
+
+      remote_offset < state.primary_base ->
+        Logger.info(
+          "DurableBuffer replica sender to #{inspect(state.node)} " <>
+            "(#{state.dir} p#{state.partition_index}) is below the primary's trimmed " <>
+            "base; discarding it and resyncing from offset #{state.primary_base}"
+        )
+
+        wipe_and_resync(state)
+
+      remote_offset < next_needed(state) ->
+        state |> note_adopted() |> start_resync(remote_offset)
 
       true ->
-        case truncate_remote(state) do
-          :ok -> start_resync(state, 0)
-          :error -> force_reattach(state)
-        end
+        state = state |> note_adopted() |> adopt_remote_tail(remote_tail)
+        state = resend_queue(%{state | mode: :live})
+        ensure_progress_check(state)
     end
+  end
+
+  defp adopt_remote_tail(state, watermark) do
+    send(state.owner, {:backend, {:watermark, state.node, watermark}})
+    {queue, queued_bytes} = drop_acked(state.queue, state.queued_bytes, watermark)
+
+    %{
+      state
+      | watermark: max(state.watermark, watermark),
+        queue: queue,
+        queued_bytes: queued_bytes
+    }
+  end
+
+  defp wipe_and_resync(state) do
+    case truncate_remote(state) do
+      :ok -> state |> note_adopted() |> start_resync(state.primary_base)
+      :error -> force_reattach(state)
+    end
+  end
+
+  defp primary_base(state) do
+    Meta.load(state.primary_dir, state.partition_index).base_byte_offset
+  end
+
+  defp note_adopted(state) do
+    send(state.owner, {:backend, {:adopted, state.node, state.epoch}})
+    state
   end
 
   defp next_needed(state) do
@@ -276,6 +425,9 @@ defmodule DurableBuffer.Replica.Sender do
 
   defp start_resync(state, cursor) do
     path = DurableBuffer.Backend.Local.wal_path(state.primary_dir, state.partition_index)
+    base = primary_base(state)
+    cursor = max(cursor, base)
+    state = %{state | primary_base: base, resync_base: cursor}
 
     case :file.open(path, [:read, :raw, :binary]) do
       {:ok, fd} ->
@@ -301,32 +453,95 @@ defmodule DurableBuffer.Replica.Sender do
       state.node,
       DurableBuffer.Replica,
       :truncate,
-      [state.dir, state.partition_index, state.epoch],
+      [state.dir, state.partition_index, state.epoch, state.primary_base],
       state.rpc_timeout
     )
   catch
     _kind, _reason -> :error
   end
 
-  defp force_reattach(state) do
+  defp force_reattach(state), do: reattach(state, @connect_retry_ms)
+
+  defp reattach(state, delay) do
     if state.monitor, do: Process.demonitor(state.monitor, [:flush])
     state = close_resync(state)
-    Process.send_after(self(), :connect, @connect_retry_ms)
-    %{state | writer: nil, monitor: nil, mode: :live}
+    if state.resync_stall_check, do: Process.cancel_timer(state.resync_stall_check)
+    Process.send_after(self(), :connect, delay)
+
+    %{
+      state
+      | writer: nil,
+        channel: nil,
+        monitor: nil,
+        attach_ref: nil,
+        mode: :live,
+        resync_stall_check: nil
+    }
   end
 
   defp close_resync(%{resync_fd: nil} = state), do: state
 
   defp close_resync(state) do
     :ok = :file.close(state.resync_fd)
-    %{state | resync_fd: nil, resync_cursor: nil}
+    %{state | resync_fd: nil, resync_cursor: nil, resync_base: nil}
   end
 
-  defp send_entry(%{writer: nil} = state, _entry), do: state
+  defp resync_inflight(%{resync_cursor: nil}), do: 0
+
+  defp resync_inflight(state) do
+    {_epoch, acked} = state.watermark
+    max(state.resync_cursor - max(acked, state.resync_base), 0)
+  end
+
+  defp ensure_resync_stall_check(%{resync_stall_check: nil} = state) do
+    ref =
+      Process.send_after(
+        self(),
+        {:check_resync, state.resync_cursor, state.watermark},
+        state.rpc_timeout
+      )
+
+    %{state | resync_stall_check: ref}
+  end
+
+  defp ensure_resync_stall_check(state), do: state
+
+  defp send_entry(%{attach_ref: nil} = state, _entry), do: state
 
   defp send_entry(state, {epoch, offset, binary}) do
-    send(state.writer, {:replicate, epoch, offset, binary, self()})
-    state
+    case send_batch(state, epoch, offset, binary) do
+      :ok -> state
+      {:error, reason} -> note_send_failure(state, reason)
+    end
+  end
+
+  defp send_batch(state, epoch, offset, binary) do
+    state.transport.send_batch(
+      state.channel,
+      state.attach_ref,
+      epoch,
+      offset,
+      binary,
+      self()
+    )
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp open_channel(state, writer) do
+    state.transport.channel(state.node, state.dir, state.partition_index, writer)
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp note_send_failure(state, reason) do
+    Logger.warning(
+      "DurableBuffer replica sender to #{inspect(state.node)} " <>
+        "(#{state.dir} p#{state.partition_index}) could not send over " <>
+        "#{inspect(state.transport)}: #{inspect(reason)}; reattaching"
+    )
+
+    force_reattach(state)
   end
 
   defp resend_queue(state) do
