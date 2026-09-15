@@ -99,7 +99,7 @@ defmodule DurableBuffer.Backend.S3 do
     binary = IO.iodata_to_binary(batch)
 
     case Req.put(state.req, url: "s3://#{state.config.bucket}/#{key}", body: binary) do
-      {:ok, %Req.Response{status: status}} when status in 200..299 ->
+      {:ok, %{status: status}} when status in 200..299 ->
         {:ok, %{state | next_offset: first_offset + count}}
 
       {:ok, %{status: status}} ->
@@ -280,7 +280,7 @@ defmodule DurableBuffer.Backend.S3 do
           do: key
 
     for key <- dropped do
-      %Req.Response{status: status} =
+      %{status: status} =
         Req.delete!(state.req, url: "s3://#{state.config.bucket}/#{key}")
 
       true = status in 200..299
@@ -367,7 +367,7 @@ defmodule DurableBuffer.Backend.S3 do
            url: "s3://#{config.bucket}/#{base_key(config, partition_index)}",
            decode_body: false
          ) do
-      {:ok, %Req.Response{status: 200, body: body}} when is_binary(body) -> parse_base(body)
+      {:ok, %{status: 200, body: body}} when is_binary(body) -> parse_base(body)
       _missing_or_error -> 0
     end
   end
@@ -380,7 +380,7 @@ defmodule DurableBuffer.Backend.S3 do
   end
 
   defp store_base(req, config, partition_index, base) do
-    %Req.Response{status: status} =
+    %{status: status} =
       Req.put!(req,
         url: "s3://#{config.bucket}/#{base_key(config, partition_index)}",
         body: Integer.to_string(base)
@@ -397,10 +397,10 @@ defmodule DurableBuffer.Backend.S3 do
 
   defp fetch!(req, config, key) do
     case Req.get(req, url: "s3://#{config.bucket}/#{key}", decode_body: false) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
+      {:ok, %{status: 200, body: body}} ->
         body
 
-      {:ok, %Req.Response{status: status}} ->
+      {:ok, %{status: status}} ->
         raise "DurableBuffer could not open #{key}: S3 answered #{status}"
 
       {:error, exception} ->
