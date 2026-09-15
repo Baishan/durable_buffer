@@ -61,10 +61,10 @@ defmodule DurableBuffer.Backend.S3 do
            url: "s3://#{state.config.bucket}/#{key}",
            body: IO.iodata_to_binary(batch)
          ) do
-      {:ok, %Req.Response{status: status}} when status in 200..299 ->
+      {:ok, %{status: status}} when status in 200..299 ->
         {:ok, %{state | seq: state.seq + 1}}
 
-      {:ok, %Req.Response{status: status}} ->
+      {:ok, %{status: status}} ->
         {:error, {:unexpected_status, status}, state}
 
       {:error, exception} ->
@@ -84,7 +84,7 @@ defmodule DurableBuffer.Backend.S3 do
           {:halt, :done}
 
         {req, [key | rest]} ->
-          %Req.Response{status: 200, body: body} =
+          %{status: 200, body: body} =
             Req.get!(req, url: "s3://#{config.bucket}/#{key}", decode_body: false)
 
           {payloads, _valid, _rest} = WAL.decode_all(body)
@@ -97,7 +97,7 @@ defmodule DurableBuffer.Backend.S3 do
   @impl DurableBuffer.Backend
   def truncate(state) do
     for key <- list_keys(state.req, state.config, state.partition_index) do
-      %Req.Response{status: status} =
+      %{status: status} =
         Req.delete!(state.req, url: "s3://#{state.config.bucket}/#{key}")
 
       true = status in 200..299
@@ -148,7 +148,7 @@ defmodule DurableBuffer.Backend.S3 do
           []
         end
 
-    %Req.Response{status: 200, body: body} =
+    %{status: 200, body: body} =
       Req.get!(req, url: "s3://#{config.bucket}?#{URI.encode_query(params)}")
 
     %{"ListBucketResult" => result} = body
